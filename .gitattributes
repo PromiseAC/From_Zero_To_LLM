@@ -1,1 +1,0 @@
-Learn_minimind/minimind/minimind-3/*.safetensors filter=lfs diff=lfs merge=lfs -text
