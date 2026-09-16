@@ -47,12 +47,21 @@ minimind/
 
 ### Special tokens
 
-| Token | Symbol | ID |
-| --- | --- | ---: |
-| BOS | `<|im_start|>` | 1 |
-| EOS | `<|im_end|>` | 2 |
-| PAD | `<|endoftext|>` | 0 |
-| UNK | `<|endoftext|>` | 0 |
+| Token | ID |
+| --- | ---: |
+| BOS | 1 |
+| EOS | 2 |
+| PAD | 0 |
+| UNK | 0 |
+
+Token symbols:
+
+```text
+BOS  <|im_start|>  ID 1
+EOS  <|im_end|>    ID 2
+PAD  <|endoftext|> ID 0
+UNK  <|endoftext|> ID 0
+```
 
 The tokenizer uses subword / byte-level-style tokenization rather than simple character-level tokenization.
 
