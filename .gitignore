@@ -5,6 +5,7 @@
 venv/
 
 # macOS
+**/.git.backup/
 .DS_Store
 
 # IDE

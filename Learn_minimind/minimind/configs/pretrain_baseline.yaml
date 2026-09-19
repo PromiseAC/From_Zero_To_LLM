@@ -77,7 +77,7 @@ reproducibility:
   config_path: "configs/pretrain_baseline.yaml"
   data_version: pretrain_t2t_mini_v1
   run_command: >-
-    cd week4_minimind/minimind/trainer &&
+    cd Learn_minimind/minimind/trainer &&
     python train_pretrain.py
     --data_path ../dataset/pretrain_t2t_mini.jsonl
     --epochs 2
