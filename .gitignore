@@ -1,0 +1,36 @@
+# Python
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+
+# Dataset files (keep dataset/README.md allowed)
+**/dataset/*.jsonl
+**/dataset/*.json
+**/dataset/*.parquet
+!**/dataset/README.md
+
+# Training artifacts
+**/checkpoints/
+**/configs/
+**/out/
+**/runs/
+**/wandb/
+
+# Model weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
