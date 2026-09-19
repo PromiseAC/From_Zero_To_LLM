@@ -1,0 +1,77 @@
+experiment:
+  experiment_id: pretrain_baseline_001
+  status: planned
+  git_commit: "7a9137d"
+  purpose: "MiniMind-3 Pretrain Baseline on RTX 3060 Laptop"
+
+data:
+  name: pretrain_t2t_mini
+  version: pretrain_t2t_mini_v1
+  path: "../dataset/pretrain_t2t_mini.jsonl"
+  samples: 1270238
+  size: "~1.2GB"
+
+model:
+  vocab_size: 6400
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  num_key_value_heads: 4
+  intermediate_size: 2432
+  use_moe: false
+  params: "~63.91M"
+
+sequence:
+  max_seq_len: 768
+
+training:
+  epochs: 2
+
+  micro_batch_size: 8
+  gradient_accumulation_steps: 4
+  world_size: 1
+  effective_batch_size: 32
+
+  micro_steps_per_epoch: 158780
+  optimizer_steps_per_epoch: 39695
+  total_micro_steps: 317560
+  total_optimizer_steps: 79390
+
+  optimizer: AdamW
+  learning_rate: 5e-4
+  weight_decay: 0.01
+
+  lr_schedule: "MiniMind get_lr cosine decay"
+  warmup_steps: 0
+
+  grad_clip: 1.0
+  precision: bfloat16
+
+  padded_tokens_per_optimizer_step: 24576
+
+runtime:
+  device: cuda
+  gpu: "NVIDIA GeForce RTX 3060 Laptop GPU"
+  gpu_memory: "6144 MiB"
+  num_workers: 8
+  seed: 42
+
+memory_probe:
+  batch_2_peak_mib: 2792
+  batch_4_peak_mib: 3590
+  batch_8_peak_mib: 5043
+  selected_micro_batch_size: 8
+
+logging:
+  log_interval: 100
+  save_interval: 1000
+
+checkpoint:
+  save_weight: pretrain_baseline
+  save_dir: "../out"
+  resume_dir: "../checkpoints"
+
+reproducibility:
+  config_path: "configs/pretrain_baseline.yaml"
+  data_version: pretrain_t2t_mini_v1
+  run_command: "TBD"
