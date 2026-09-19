@@ -20,6 +20,34 @@ from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint
 
 warnings.filterwarnings('ignore')
 
+def save_model_snapshot(model, lm_config, step, save_weight, snapshot_dir):
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+    moe_suffix = '_moe' if lm_config.use_moe else ''
+
+    raw_model = (
+        model.module
+        if isinstance(model, DistributedDataParallel)
+        else model
+    )
+
+    raw_model = getattr(raw_model, '_orig_mod', raw_model)
+
+    state_dict = {
+        k: v.half().cpu()
+        for k, v in raw_model.state_dict().items()
+    }
+
+    snapshot_path = os.path.join(
+        snapshot_dir,
+        f'{save_weight}_step{step:04d}_{lm_config.hidden_size}{moe_suffix}.pth'
+    )
+
+    torch.save(state_dict, snapshot_path)
+
+    Logger(f'Snapshot saved: {snapshot_path}')
+
+    del state_dict
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
@@ -47,6 +75,14 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
+        if step in args.snapshot_steps and is_main_process():
+            save_model_snapshot(
+                model=model,
+                lm_config=lm_config,
+                step=step,
+                save_weight=args.save_weight,
+                snapshot_dir=args.snapshot_dir
+            )
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -94,6 +130,18 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    parser.add_argument(
+        "--snapshot_steps",
+        type=str,
+        default="",
+        help="额外保存模型快照的 micro steps，例如 100,500,1000"
+    )
+    parser.add_argument(
+        "--snapshot_dir",
+        type=str,
+        default="../checkpoints/fixed_prompt_eval",
+        help="额外模型快照保存目录"
+    )
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
@@ -106,6 +154,11 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     args = parser.parse_args()
+    args.snapshot_steps = {
+        int(x.strip())
+        for x in args.snapshot_steps.split(",")
+        if x.strip()
+    }
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
