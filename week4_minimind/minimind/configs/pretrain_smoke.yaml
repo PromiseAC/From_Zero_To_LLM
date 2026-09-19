@@ -1,7 +1,9 @@
 experiment:
   experiment_id: pretrain_smoke_001
   purpose: "验证 MiniMind Pretrain 完整训练链路"
-  git_commit: "7a9137d"
+  source_commit: "7a9137d"
+  # Record the code actually used at run time with: git rev-parse HEAD
+  repo_commit_at_run: null
 
 data:
   name: pretrain_smoke

@@ -1,7 +1,9 @@
 experiment:
   experiment_id: pretrain_baseline_001
   status: planned
-  git_commit: "7a9137d"
+  source_commit: "7a9137d"
+  # Record the code actually used at run time with: git rev-parse HEAD
+  repo_commit_at_run: null
   purpose: "MiniMind-3 Pretrain Baseline on RTX 3060 Laptop"
 
 data:
@@ -74,4 +76,19 @@ checkpoint:
 reproducibility:
   config_path: "configs/pretrain_baseline.yaml"
   data_version: pretrain_t2t_mini_v1
-  run_command: "TBD"
+  run_command: >-
+    cd week4_minimind/minimind/trainer &&
+    python train_pretrain.py
+    --data_path ../dataset/pretrain_t2t_mini.jsonl
+    --epochs 2
+    --batch_size 8
+    --accumulation_steps 4
+    --hidden_size 768
+    --num_hidden_layers 8
+    --max_seq_len 768
+    --learning_rate 5e-4
+    --device cuda
+    --num_workers 8
+    --log_interval 100
+    --save_interval 1000
+    --save_weight pretrain_baseline
