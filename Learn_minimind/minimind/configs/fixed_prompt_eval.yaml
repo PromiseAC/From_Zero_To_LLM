@@ -1,0 +1,112 @@
+experiment:
+  experiment_id: fixed_prompt_eval_001
+  purpose: "Compare Early / Middle / Late pretraining checkpoints under fixed evaluation conditions"
+  source_commit: "7a9137d"
+  repo_commit_at_run: null
+
+data:
+  source: "dataset/pretrain_learning_10k.jsonl"
+  split_seed: 42
+
+  train:
+    path: "../dataset/pretrain_fixed_train_8k.jsonl"
+    samples: 8000
+
+  validation:
+    path: "../dataset/pretrain_fixed_val_2k.jsonl"
+    samples: 2000
+
+model:
+  vocab_size: 6400
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_attention_heads: 8
+  num_key_value_heads: 4
+  use_moe: false
+  params: "~63.91M"
+
+training:
+  epochs: 1
+
+  micro_batch_size: 8
+  gradient_accumulation_steps: 4
+  world_size: 1
+  effective_batch_size: 32
+
+  max_seq_len: 768
+
+  optimizer: AdamW
+  learning_rate: 5e-4
+  weight_decay: 0.01
+
+  lr_schedule: "MiniMind get_lr cosine decay"
+  warmup_steps: 0
+
+  grad_clip: 1.0
+  precision: bfloat16
+  seed: 42
+
+  total_micro_steps: 1000
+  total_optimizer_steps: 250
+
+checkpoint:
+  save_weight: "pretrain_fixed_eval"
+
+  snapshot_steps:
+    early: 100
+    middle: 500
+    late: 1000
+
+  snapshot_dir: "../checkpoints/fixed_prompt_eval"
+
+generation:
+  prompts:
+    - "中国的首都是"
+    - "机器学习是"
+    - "1 + 1 ="
+
+  decoding: greedy
+  do_sample: false
+  max_new_tokens: 64
+
+  # Greedy decoding does not use sampling parameters.
+  temperature: null
+  top_p: null
+  seed: null
+
+evaluation:
+  train_eval_dataset: "../dataset/pretrain_fixed_train_8k.jsonl"
+  validation_dataset: "../dataset/pretrain_fixed_val_2k.jsonl"
+
+  compare:
+    - train_loss
+    - validation_loss
+    - generation_result
+
+runtime:
+  device: cuda
+  gpu: "NVIDIA GeForce RTX 3060 Laptop GPU"
+  gpu_memory: "6144 MiB"
+  num_workers: 8
+
+reproducibility:
+  run_command: >-
+    cd Learn_minimind/minimind/trainer &&
+    python train_pretrain.py
+    --data_path ../dataset/pretrain_fixed_train_8k.jsonl
+    --epochs 1
+    --batch_size 8
+    --accumulation_steps 4
+    --hidden_size 768
+    --num_hidden_layers 8
+    --max_seq_len 768
+    --learning_rate 5e-4
+    --device cuda
+    --dtype bfloat16
+    --num_workers 8
+    --seed 42
+    --log_interval 50
+    --save_interval 1000
+    --save_weight pretrain_fixed_eval
+    --snapshot_steps 100,500,1000
+    --snapshot_dir ../checkpoints/fixed_prompt_eval
