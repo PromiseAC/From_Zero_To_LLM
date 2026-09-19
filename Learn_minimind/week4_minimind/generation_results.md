@@ -2,7 +2,8 @@
 
 ## Experiment Setup
 
-- Git commit: `518e9a563a073ee95374ca047242ccbf55bb1334`
+- Training snapshot commit: `79e46399ca7cf4bff3ce321010ee1b6d0377f8b7`
+- Evaluation code commit: `518e9a563a073ee95374ca047242ccbf55bb1334`
 - Model: MiniMind Pretrain
 - hidden_size: `768`
 - num_hidden_layers: `8`
