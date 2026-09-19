@@ -1,31 +1,56 @@
-# Week 4 Day 3 - MiniMind Dataset & Training Loop
+# Week 4 Day 3 - MiniMind Dataset 与 Training Loop
 
-## 1. Today's Goal
+## 0. 中文复习总结
 
-Today the goal is not to relearn PyTorch training from scratch, but to map the concepts learned in Week 3 onto MiniMind's real pretraining code.
-
-Main path:
+今天的目标不是重新学习 PyTorch 训练循环，而是把第三周已经学过的：
 
 ```text
-JSON Data
+Dataset / DataLoader
+→ input_ids / labels
+→ Forward
+→ logits
+→ Next-token Loss
+→ backward
+→ Gradient Accumulation
+→ Gradient Clipping
+→ AdamW
+→ Learning Rate
+→ Checkpoint / Resume
+```
+
+映射到 MiniMind 的真实预训练源码中。
+
+完整主线：
+
+```text
+JSON 数据
 ↓
 PretrainDataset
 ↓
 DataLoader
 ↓
-input_ids / labels
+input_ids [B,T]
+labels [B,T]
 ↓
 MiniMindForCausalLM
 ↓
-logits
+logits [B,T,V]
 ↓
-Next-token CrossEntropy
+Next-token Shift
 ↓
-backward
+CrossEntropy
 ↓
-Gradient Accumulation
+loss
 ↓
-Gradient Clipping
+loss / accumulation_steps
+↓
+backward()
+↓
+累积 N 个 micro batch 的梯度
+↓
+unscale
+↓
+clip_grad_norm_
 ↓
 optimizer.step()
 ↓
@@ -34,53 +59,240 @@ zero_grad()
 Checkpoint / Resume
 ```
 
+今天最重要的几个结论：
+
+```text
+Dataset 单个样本       → [T]
+DataLoader 一个 batch  → [B,T]
+
+input_ids / labels     → [B,T]
+hidden_states          → [B,T,D]
+logits                 → [B,T,V]
+loss                   → scalar
+```
+
+MiniMind 的 `PretrainDataset` 不提前做 next-token shift。
+
+它返回：
+
+```text
+input_ids [B,T]
+labels    [B,T]
+```
+
+其中：
+
+```text
+labels ≈ input_ids.clone()
+```
+
+但 PAD 位置会被替换成：
+
+```text
+-100
+```
+
+真正的 next-token shift 在模型内部：
+
+```python
+x = logits[..., :-1, :]
+y = labels[..., 1:]
+```
+
+于是：
+
+```text
+x [B,T-1,V]
+y [B,T-1]
+```
+
+Gradient Accumulation 中一定要区分：
+
+```text
+micro step
+≠
+optimizer.step()
+```
+
+`backward()` 负责计算并累积梯度：
+
+```text
+parameter.grad
+```
+
+而：
+
+```python
+optimizer.step()
+```
+
+才真正修改模型参数。
+
+MiniMind 默认：
+
+```text
+batch_size = 32
+accumulation_steps = 8
+```
+
+所以单进程下：
+
+```text
+8 个 micro batch
+×
+每个 32 条 sequence
+=
+256 条 sequence
+```
+
+共同形成一次正常的 optimizer update。
+
+更新顺序必须记住：
+
+```text
+forward
+↓
+loss / accumulation_steps
+↓
+backward
+↓
+累计 N 次
+↓
+unscale
+↓
+clip_grad_norm_
+↓
+optimizer.step()
+↓
+zero_grad()
+```
+
+MiniMind 当前的学习率实现不是独立的 `scheduler.step()`，而是每个 micro step 调用：
+
+```python
+get_lr(...)
+```
+
+直接把当前学习率写进 optimizer。
+
+当前 `get_lr()` 是：
+
+```text
+Cosine Decay
+```
+
+没有显式 Warmup，并且最终学习率下降到 base learning rate 的约 10%。
+
+Resume Training 也不能只恢复：
+
+```text
+model.state_dict()
+```
+
+因为 AdamW 还维护：
+
+```text
+m
+v
+optimizer step
+```
+
+等历史状态。
+
+因此完整 resume 需要尽量恢复：
+
+```text
+model
+optimizer
+scaler
+epoch
+step
+...
+```
+
+可以把 Resume Checkpoint 理解为：
+
+```text
+训练现场快照
+```
+
 ---
 
-# 2. PretrainDataset
+# 1. 关键源码位置
 
-Source:
+Dataset：
 
 ```text
 dataset/lm_dataset.py
 ```
 
-Core class:
+预训练 Dataset：
 
 ```python
 class PretrainDataset(Dataset):
 ```
 
-MiniMind reads pretraining data through:
+预训练入口：
 
-```python
-self.samples = load_dataset(
-    'json',
-    data_files=data_path,
-    split='train'
-)
+```text
+trainer/train_pretrain.py
 ```
 
-Each sample uses:
+Checkpoint / Learning Rate 等工具：
+
+```text
+trainer/trainer_utils.py
+```
+
+模型：
+
+```text
+model/model_minimind.py
+```
+
+---
+
+# 2. PretrainDataset
+
+核心逻辑：
+
+```python
+class PretrainDataset(Dataset):
+    def __init__(self, data_path, tokenizer, max_length=512):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.samples = load_dataset(
+            'json',
+            data_files=data_path,
+            split='train'
+        )
+```
+
+说明 MiniMind 预训练数据来自：
+
+```text
+JSON / JSONL
+```
+
+每个样本主要读取：
 
 ```python
 sample['text']
 ```
 
-So a pretraining sample is essentially plain text.
-
-Example conceptually:
+概念上类似：
 
 ```json
 {
-  "text": "这是一段用于语言模型预训练的文本。"
+  "text": "这里是一段用于预训练的文本。"
 }
 ```
 
 ---
 
-# 3. Tokenization and Fixed Length
+# 3. Tokenizer 与 BOS / EOS
 
-Core logic:
+Dataset 中：
 
 ```python
 tokens = self.tokenizer(
@@ -89,41 +301,71 @@ tokens = self.tokenizer(
     max_length=self.max_length - 2,
     truncation=True
 ).input_ids
-
-tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
 ```
 
-Why `max_length - 2`?
+然后手动加入：
 
-Because MiniMind manually adds:
+```python
+tokens = [
+    self.tokenizer.bos_token_id
+] + tokens + [
+    self.tokenizer.eos_token_id
+]
+```
+
+所以：
+
+```text
+正文最大长度
+=
+max_length - 2
+```
+
+预留两个位置给：
 
 ```text
 BOS
-+
-text tokens
-+
 EOS
 ```
 
-If:
+例如：
 
 ```text
 max_length = 340
 ```
 
-then the text itself can use at most:
+则正文最多：
 
 ```text
 338 tokens
 ```
 
-and after adding BOS and EOS the maximum becomes:
+再加：
 
 ```text
-340 tokens
+BOS + EOS
 ```
 
-If the sample is shorter, MiniMind pads it:
+总长度最多：
+
+```text
+340
+```
+
+这与周一验证的 tokenizer 行为一致：
+
+```text
+普通 encode
+不会自动加入 BOS / EOS
+```
+
+所以 Dataset 手动添加。
+
+---
+
+# 4. Padding
+
+如果实际 token 数不足 `max_length`：
 
 ```python
 input_ids = tokens + [
@@ -131,79 +373,114 @@ input_ids = tokens + [
 ] * (self.max_length - len(tokens))
 ```
 
-Therefore one sample always has a fixed sequence length.
+例如：
+
+```text
+[BOS, 10, 20, 30, EOS]
+```
+
+补成：
+
+```text
+[BOS, 10, 20, 30, EOS, PAD, PAD, ...]
+```
+
+这样不同长度的样本才能组成统一 Tensor。
 
 ---
 
-# 4. Dataset Shape
+# 5. Dataset 与 DataLoader 的 Shape
 
-A very important distinction:
+这是今天非常容易混淆的一点。
 
-`Dataset.__getitem__()` returns one sample, not one batch.
+Dataset 一次：
 
-Single sample:
+```python
+__getitem__()
+```
+
+只返回一个样本。
+
+所以：
 
 ```text
 input_ids [T]
 labels    [T]
 ```
 
-With the default pretrain setting:
+不是：
 
 ```text
-T = max_seq_len = 340
+[B,T]
 ```
 
-so one item is:
+例如 MiniMind 默认：
+
+```text
+max_seq_len = 340
+```
+
+单个样本：
 
 ```text
 input_ids [340]
 labels    [340]
 ```
 
-After `DataLoader` batches multiple samples:
+DataLoader 才会把多个样本组成 batch。
 
-```text
-input_ids [B,T]
-labels    [B,T]
-```
-
-For the default:
+默认：
 
 ```text
 batch_size = 32
-max_seq_len = 340
 ```
 
-one full batch is approximately:
+因此：
 
 ```text
 input_ids [32,340]
 labels    [32,340]
 ```
 
-Remember:
+必须牢记：
 
 ```text
 Dataset
-→ one sample [T]
+→ [T]
 
 DataLoader
-→ one batch [B,T]
+→ [B,T]
 ```
 
 ---
 
-# 5. Labels and PAD Masking
+# 6. Labels
 
-MiniMind creates labels using:
+Dataset 中：
 
 ```python
 labels = input_ids.clone()
-labels[input_ids == self.tokenizer.pad_token_id] = -100
 ```
 
-Example:
+所以一开始：
+
+```text
+input_ids:
+[BOS, 10, 20, 30, EOS, PAD, PAD]
+
+labels:
+[BOS, 10, 20, 30, EOS, PAD, PAD]
+```
+
+然后：
+
+```python
+labels[
+    input_ids == self.tokenizer.pad_token_id
+] = -100
+```
+
+得到：
 
 ```text
 input_ids:
@@ -213,67 +490,106 @@ labels:
 [BOS, 10, 20, 30, EOS, -100, -100]
 ```
 
-Important:
+注意：
 
 ```text
-input_ids keeps PAD
-labels changes PAD to -100
+input_ids 中 PAD 仍然存在
 ```
 
-Why `-100`?
+只有 labels 中 PAD 位置变成：
 
-Because the model later uses:
-
-```python
-F.cross_entropy(..., ignore_index=-100)
+```text
+-100
 ```
-
-So PAD positions do not contribute to the language-model loss.
 
 ---
 
-# 6. Dataset Does NOT Shift Labels
+# 7. 为什么用 -100
 
-The Dataset does not create:
+模型内部 CrossEntropy：
 
-```text
-x = input_ids[:-1]
-y = input_ids[1:]
+```python
+F.cross_entropy(
+    ...,
+    ignore_index=-100
+)
 ```
 
-Instead it returns:
+所以：
+
+```text
+label = -100
+```
+
+的位置不会参与 Loss。
+
+因此：
+
+```text
+PAD Token
+→ 不计算训练损失
+```
+
+---
+
+# 8. Dataset 不做 Next-token Shift
+
+MiniMind Dataset 返回：
 
 ```text
 input_ids [B,T]
 labels    [B,T]
 ```
 
-The next-token shift happens inside:
+Dataset 中没有提前做：
+
+```text
+input_ids[:-1]
+labels[1:]
+```
+
+真正 shift 在：
 
 ```text
 MiniMindForCausalLM.forward()
 ```
 
-with:
+中完成：
 
 ```python
 x = logits[..., :-1, :].contiguous()
 y = labels[..., 1:].contiguous()
 ```
 
-Therefore:
+所以：
 
 ```text
-logits [B,T,V]
-↓
-x [B,T-1,V]
+logits
+[B,T,V]
 
-labels [B,T]
 ↓
-y [B,T-1]
+
+x
+[B,T-1,V]
 ```
 
-Example:
+而：
+
+```text
+labels
+[B,T]
+
+↓
+
+y
+[B,T-1]
+```
+
+---
+
+# 9. Next-token Prediction 示例
+
+假设 Dataset：
 
 ```text
 input_ids:
@@ -283,57 +599,73 @@ labels:
 [BOS, A, B, C, EOS, -100]
 ```
 
-After shifting:
+模型 shift 后：
 
 ```text
-prediction position   target
+预测位置          Target
 
-BOS                → A
-A                  → B
-B                  → C
-C                  → EOS
-EOS                → -100
+BOS       →       A
+A         →       B
+B         →       C
+C         →       EOS
+EOS       →       -100
 ```
 
-This is standard causal next-token prediction.
+所以最后一项不计算 Loss。
+
+这就是：
+
+```text
+Causal Language Modeling
+=
+Next-token Prediction
+```
 
 ---
 
-# 7. DataLoader to Model
+# 10. DataLoader 到 Model
 
-The training loop receives:
+训练循环：
 
 ```python
 for step, (input_ids, labels) in enumerate(loader, ...):
 ```
 
-So one training micro-batch contains:
+一个 micro batch：
 
 ```text
 input_ids [B,T]
 labels    [B,T]
 ```
 
-Then:
+默认：
+
+```text
+[32,340]
+[32,340]
+```
+
+然后：
 
 ```python
 input_ids = input_ids.to(args.device)
 labels = labels.to(args.device)
 ```
 
-Only the device changes; shape does not.
+只是移动设备，Shape 不改变。
 
 ---
 
-# 8. Forward Path and Tensor Shapes
+# 11. Forward 完整 Shape
 
-MiniMind receives:
+输入：
 
 ```text
-input_ids [B,T]
+input_ids
+[B,T]
 ```
 
-Then:
+进入 MiniMind：
 
 ```text
 input_ids
@@ -360,22 +692,16 @@ logits
 [B,T,V]
 ```
 
-With MiniMind's default model configuration:
-
-```text
-D = 768
-V = 6400
-N = 8
-```
-
-and with the default training batch:
+默认：
 
 ```text
 B = 32
 T = 340
+D = 768
+V = 6400
 ```
 
-the main shapes are:
+因此：
 
 ```text
 input_ids
@@ -385,7 +711,7 @@ input_ids
 
 [32,340,768]
 
-↓ 8 × MiniMindBlock
+↓ 8 × Transformer Block
 
 [32,340,768]
 
@@ -399,276 +725,432 @@ logits
 [32,340,6400]
 ```
 
-Inside each Transformer Block:
-
-```text
-RMSNorm
-↓
-Attention
-↓
-Residual
-↓
-RMSNorm
-↓
-SwiGLU FeedForward
-↓
-Residual
-```
-
-The Block output remains:
-
-```text
-[B,T,D]
-```
-
-The `LM Head` is what changes the last dimension:
-
-```text
-D → V
-```
-
-and produces the actual logits.
-
 ---
 
-# 9. Next-token Loss
+# 12. Next-token Loss Shape
 
-The model internally performs:
-
-```python
-x = logits[..., :-1, :].contiguous()
-y = labels[..., 1:].contiguous()
-```
-
-Therefore, with:
-
-```text
-B = 32
-T = 340
-V = 6400
-```
-
-we get:
-
-```text
-x [32,339,6400]
-y [32,339]
-```
-
-Then:
+模型内部：
 
 ```python
-x.view(-1, x.size(-1))
-y.view(-1)
+x = logits[..., :-1, :]
+y = labels[..., 1:]
 ```
 
-becomes:
+所以：
 
 ```text
-x [32×339, 6400]
-y [32×339]
+x
+[32,339,6400]
+
+y
+[32,339]
 ```
 
-Finally:
+然后：
+
+```text
+x
+[32×339,6400]
+
+y
+[32×339]
+```
+
+再送入：
 
 ```text
 CrossEntropy
-↓
-scalar loss
 ```
 
-Important distinction:
+最终：
 
 ```text
-input_ids / labels  [B,T]
-hidden_states       [B,T,D]
-logits              [B,T,V]
-loss                scalar
+loss
+scalar
 ```
 
 ---
 
-# 10. Total Loss
-
-Training uses:
-
-```python
-res = model(input_ids, labels=labels)
-
-loss = res.loss + res.aux_loss
-```
-
-Where:
+# 13. 四种 Tensor 必须区分
 
 ```text
-res.loss
-→ causal language-model CrossEntropy loss
-
-res.aux_loss
-→ MoE auxiliary/router loss
+input_ids
+[B,T]
 ```
 
-The default MiniMind pretrain configuration has:
+每个位置是一个：
+
+```text
+Token ID
+```
+
+---
+
+```text
+labels
+[B,T]
+```
+
+每个位置是目标 Token ID，或者：
+
+```text
+-100
+```
+
+---
+
+```text
+hidden_states
+[B,T,D]
+```
+
+每个位置是一个 D 维向量。
+
+---
+
+```text
+logits
+[B,T,V]
+```
+
+每个位置是对整个 vocabulary 的 V 个预测分数。
+
+---
+
+# 14. Training Loop 主体
+
+MiniMind：
+
+```python
+with autocast_ctx:
+    res = model(input_ids, labels=labels)
+    loss = res.loss + res.aux_loss
+    loss = loss / args.accumulation_steps
+
+scaler.scale(loss).backward()
+```
+
+这里可以拆成：
+
+```text
+Forward
+↓
+Language Model Loss
+↓
+MoE Aux Loss（如果使用 MoE）
+↓
+Total Loss
+↓
+除以 accumulation_steps
+↓
+backward
+```
+
+默认：
 
 ```text
 use_moe = False
 ```
 
-so the main path is the standard language-model loss.
+所以主线主要是：
+
+```text
+Causal LM CrossEntropy Loss
+```
 
 ---
 
-# 11. Gradient Accumulation
+# 15. Gradient Accumulation
 
-Default:
-
-```text
-batch_size = 32
-accumulation_steps = 8
-```
-
-MiniMind first does:
-
-```python
-loss = loss / args.accumulation_steps
-scaler.scale(loss).backward()
-```
-
-This means every micro-batch performs a backward pass, but parameters are not updated after every micro-batch.
-
-The key distinction:
-
-```text
-micro step
-→ process one DataLoader batch
-
-backward()
-→ calculate / accumulate gradients
-
-optimizer.step()
-→ actually update model parameters
-```
-
-These are not the same thing.
-
-With:
+默认参数：
 
 ```text
 batch_size = 32
 accumulation_steps = 8
 ```
 
-the process is:
+MiniMind 每一个 DataLoader batch 都会：
+
+```text
+forward
+↓
+loss / 8
+↓
+backward
+```
+
+但不会每个 batch 都更新参数。
+
+流程：
 
 ```text
 micro step 1
-32 sequences
-→ forward
-→ loss / 8
 → backward
 
 micro step 2
-32 sequences
-→ forward
-→ loss / 8
 → backward
 
 ...
 
 micro step 8
-32 sequences
-→ forward
-→ loss / 8
 → backward
-
-↓
-optimizer.step()
+→ optimizer.step()
+→ zero_grad()
 ```
 
-Therefore:
+因此：
 
 ```text
-8 micro-batches
-×
-32 sequences per micro-batch
-=
-256 sequences
-```
-
-contribute to one normal parameter update on a single process.
-
-So:
-
-```text
-effective batch size
-=
-micro_batch_size
-× accumulation_steps
-```
-
-Single process:
-
-```text
-32 × 8 = 256 sequences
-```
-
-With DDP:
-
-```text
-global batch size
-=
-micro_batch_size
-× accumulation_steps
-× world_size
+8 个 micro step
+→ 1 次 optimizer update
 ```
 
 ---
 
-# 12. Why Divide Loss by accumulation_steps?
+# 16. micro step 与 optimizer.step()
 
-MiniMind uses:
+一定要分开：
+
+```text
+micro step
+=
+DataLoader 处理了一个 batch
+```
+
+而：
+
+```text
+optimizer.step()
+=
+模型参数真正更新一次
+```
+
+所以：
+
+```text
+step
+≠
+optimizer.step()
+```
+
+Gradient Accumulation 的情况下，一个 optimizer update 之前会有多次 backward。
+
+---
+
+# 17. Effective Batch Size
+
+如果：
+
+```text
+batch_size = 32
+accumulation_steps = 8
+world_size = 1
+```
+
+那么：
+
+```text
+effective batch size
+=
+32 × 8
+=
+256 sequences
+```
+
+即：
+
+```text
+micro step 1 → 32
+micro step 2 → 32
+...
+micro step 8 → 32
+
+总计：
+256 条 sequence
+
+↓
+
+一次 optimizer.step()
+```
+
+如果 DDP：
+
+```text
+global batch size
+=
+batch_size
+× accumulation_steps
+× world_size
+```
+
+例如：
+
+```text
+32 × 8 × 2
+=
+512
+```
+
+---
+
+# 18. backward() 到底做什么
+
+```python
+loss.backward()
+```
+
+并不会直接修改模型参数。
+
+它负责：
+
+```text
+计算梯度
++
+把梯度累积到 parameter.grad
+```
+
+如果连续执行：
+
+```text
+backward()
+backward()
+backward()
+```
+
+而中间没有：
+
+```text
+zero_grad()
+```
+
+梯度就会继续累加。
+
+这正是 Gradient Accumulation 的基础。
+
+---
+
+# 19. optimizer.step() 到底做什么
+
+真正修改参数的是：
+
+```python
+optimizer.step()
+```
+
+因此必须区分：
+
+```text
+backward()
+→ 算梯度 / 累积梯度
+
+optimizer.step()
+→ 根据梯度更新模型参数
+
+zero_grad()
+→ 清空梯度
+```
+
+---
+
+# 20. 为什么 Loss 要除 accumulation_steps
+
+源码：
 
 ```python
 loss = loss / args.accumulation_steps
 ```
 
-before every backward.
-
-Without this division, accumulating 8 micro-batches would approximately make the accumulated gradient 8 times larger than the average-gradient version.
-
-Conceptually:
+如果累积：
 
 ```text
-micro batch 1 → loss / 8 → backward
-micro batch 2 → loss / 8 → backward
+8 个 micro batch
+```
+
+而每一个 Loss 都不除以 8，那么累计梯度的尺度会大约放大 8 倍。
+
+因此：
+
+```text
+loss / 8
+↓ backward
+
+loss / 8
+↓ backward
+
 ...
-micro batch 8 → loss / 8 → backward
 ```
 
-The gradients accumulate in:
-
-```text
-parameter.grad
-```
-
-until the optimizer update.
+最终更接近多个 micro batch 平均 Loss 的梯度。
 
 ---
 
-# 13. Complete Parameter Update Order
+# 21. 参数更新条件
 
-This is the most important order to remember:
+MiniMind：
+
+```python
+if step % args.accumulation_steps == 0:
+```
+
+默认：
 
 ```text
-forward
-↓
-loss
-↓
-loss / accumulation_steps
-↓
-backward
-↓
-accumulate gradients for N micro-batches
+accumulation_steps = 8
+```
+
+所以：
+
+```text
+step 8
+step 16
+step 24
+...
+```
+
+会进行参数更新。
+
+第一次：
+
+```text
+step 1 ~ 8
+```
+
+共有：
+
+```text
+8 次 backward
+```
+
+然后：
+
+```text
+1 次 optimizer.step
+```
+
+---
+
+# 22. 参数更新完整顺序
+
+MiniMind：
+
+```python
+scaler.unscale_(optimizer)
+
+torch.nn.utils.clip_grad_norm_(
+    model.parameters(),
+    args.grad_clip
+)
+
+scaler.step(optimizer)
+scaler.update()
+
+optimizer.zero_grad(set_to_none=True)
+```
+
+顺序：
+
+```text
+累计 N 次 backward
 ↓
 unscale
 ↓
@@ -681,37 +1163,19 @@ scaler.update()
 zero_grad()
 ```
 
-MiniMind code:
-
-```python
-loss = loss / args.accumulation_steps
-scaler.scale(loss).backward()
-
-if step % args.accumulation_steps == 0:
-    scaler.unscale_(optimizer)
-
-    torch.nn.utils.clip_grad_norm_(
-        model.parameters(),
-        args.grad_clip
-    )
-
-    scaler.step(optimizer)
-    scaler.update()
-
-    optimizer.zero_grad(set_to_none=True)
-```
+必须记住这个顺序。
 
 ---
 
-# 14. Gradient Clipping
+# 23. Gradient Clipping
 
-Default:
+默认：
 
 ```text
 grad_clip = 1.0
 ```
 
-Before an optimizer update MiniMind calls:
+源码：
 
 ```python
 torch.nn.utils.clip_grad_norm_(
@@ -720,33 +1184,41 @@ torch.nn.utils.clip_grad_norm_(
 )
 ```
 
-This should be understood precisely:
+MiniMind 在准备参数更新时都会调用这个函数。
 
-MiniMind calls `clip_grad_norm_()` whenever it is about to update parameters.
-
-The function then effectively behaves as:
+如果：
 
 ```text
-global grad norm <= threshold
-→ gradients remain essentially unchanged
-
-global grad norm > threshold
-→ gradients are rescaled
+global grad norm <= 1.0
 ```
 
-It is NOT element-wise clipping such as:
+梯度基本不会被改变。
+
+如果：
 
 ```text
-each gradient value clipped to [-1,1]
+global grad norm > 1.0
 ```
 
-Instead, it controls the global gradient norm.
+梯度会整体按比例缩小，使范数受到限制。
+
+注意它不是：
+
+```text
+把每一个梯度元素都裁剪到 [-1,1]
+```
+
+而是：
+
+```text
+Global Gradient Norm Clipping
+```
 
 ---
 
-# 15. Mixed Precision and GradScaler
+# 24. GradScaler
 
-MiniMind defines:
+MiniMind：
 
 ```python
 scaler = torch.cuda.amp.GradScaler(
@@ -754,147 +1226,190 @@ scaler = torch.cuda.amp.GradScaler(
 )
 ```
 
-So GradScaler is mainly active for:
+默认：
 
 ```text
-float16
+dtype = bfloat16
 ```
 
-The default pretrain dtype is:
+所以默认情况下：
 
 ```text
-bfloat16
+GradScaler disabled
 ```
 
-Therefore, in the default configuration GradScaler is disabled.
-
-When FP16 scaling is active, the order matters:
+如果使用 FP16：
 
 ```text
+loss
+↓ scale
 scaled loss
-↓
-backward
-↓
+↓ backward
 scaled gradients
-↓
-scaler.unscale_(optimizer)
-↓
-real gradients
-↓
-clip_grad_norm_
-↓
-optimizer step
+↓ unscale
+真实 gradients
+↓ gradient clipping
 ```
 
-Gradient clipping should operate on unscaled gradients.
+所以必须：
+
+```text
+先 unscale
+再 clip
+```
 
 ---
 
-# 16. optimizer.step() and zero_grad()
+# 25. zero_grad()
 
-`backward()` does not update model parameters.
-
-It only calculates and accumulates gradients.
-
-The actual parameter update happens at:
-
-```python
-scaler.step(optimizer)
-```
-
-which corresponds to the optimizer performing its update.
-
-After the update:
+完成参数更新后：
 
 ```python
 optimizer.zero_grad(set_to_none=True)
 ```
 
-clears gradients so the next accumulation cycle can start from zero.
+用于清空本轮累计梯度。
 
-Therefore:
+如果在每个 micro batch 后都：
+
+```python
+zero_grad()
+```
+
+那么前面 batch 的梯度就会丢失，Gradient Accumulation 失效。
+
+正确：
 
 ```text
-backward()
-→ calculate / accumulate gradients
-
+batch 1 → backward
+batch 2 → backward
+...
+batch 8 → backward
+↓
 optimizer.step()
-→ modify parameters
-
+↓
 zero_grad()
-→ clear gradients
 ```
 
 ---
 
-# 17. Leftover Micro-batches at Epoch End
+# 26. Epoch 最后不足 accumulation_steps
 
-Suppose:
+MiniMind 还处理了 epoch 最后的剩余梯度。
+
+例如：
 
 ```text
 accumulation_steps = 4
+一个 epoch = 10 个 batch
 ```
 
-and one epoch contains:
-
-```text
-10 micro-batches
-```
-
-The flow is:
+流程：
 
 ```text
 batch 1~4
-→ optimizer.step() # update 1
+→ optimizer.step() # 第1次
 
 batch 5~8
-→ optimizer.step() # update 2
+→ optimizer.step() # 第2次
 
 batch 9~10
-→ epoch ends with remaining gradients
-→ optimizer.step() # update 3
+→ epoch 结束
+→ 再 optimizer.step() # 第3次
 ```
 
-MiniMind explicitly handles this:
+所以剩余 batch 不会直接丢弃。
+
+源码最后：
 
 ```python
 if last_step > start_step and \
    last_step % args.accumulation_steps != 0:
-
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(...)
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
 ```
 
-So leftover gradients are not simply discarded.
+会对剩余梯度做一次参数更新。
 
-Important implementation detail:
+---
 
-MiniMind still divides every micro-batch loss by the configured:
+# 27. 剩余 batch 的一个实现细节
+
+即使最后只剩：
 
 ```text
-accumulation_steps
+2 个 batch
 ```
 
-even if the final accumulation group contains fewer micro-batches.
-
-For example, if only 2 batches remain while:
+而：
 
 ```text
 accumulation_steps = 4
 ```
 
-those two losses are still divided by 4.
+MiniMind 前面仍然执行：
+
+```python
+loss = loss / 4
+```
+
+不会因为最后只有 2 个 batch 就临时改成：
+
+```text
+loss / 2
+```
+
+所以最后一次 update 的梯度尺度会比完整累积组更小。
+
+这是当前源码的真实行为。
 
 ---
 
-# 18. Learning Rate Schedule
+# 28. AdamW
 
-MiniMind does not use a separate scheduler object in this pretraining script.
+MiniMind：
 
-Instead, every micro step calculates the learning rate manually:
+```python
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=args.learning_rate
+)
+```
+
+AdamW 不仅依赖当前 gradient。
+
+它还维护历史状态：
+
+```text
+m
+→ 一阶动量 / 梯度历史
+
+v
+→ 二阶动量 / 梯度平方历史
+
+step
+→ optimizer 已更新次数
+```
+
+因此：
+
+```text
+AdamW
+=
+当前梯度
++
+历史优化状态
+```
+
+---
+
+# 29. Learning Rate
+
+MiniMind 没有创建独立：
+
+```text
+scheduler
+```
+
+而是在每个 micro step 手动调用：
 
 ```python
 lr = get_lr(
@@ -902,12 +1417,32 @@ lr = get_lr(
     args.epochs * iters,
     args.learning_rate
 )
+```
 
+然后：
+
+```python
 for param_group in optimizer.param_groups:
     param_group['lr'] = lr
 ```
 
-The function is:
+也就是：
+
+```text
+当前 micro step
+↓
+get_lr()
+↓
+计算 LR
+↓
+写入 optimizer
+```
+
+---
+
+# 30. get_lr()
+
+源码：
 
 ```python
 def get_lr(current_step, total_steps, lr):
@@ -921,188 +1456,156 @@ def get_lr(current_step, total_steps, lr):
     )
 ```
 
-This is cosine decay.
-
-It does not contain a warmup stage.
-
-Key positions:
+这是：
 
 ```text
-start:
-approximately 1.0 × base_lr
-
-middle:
-0.55 × base_lr
-
-end:
-0.1 × base_lr
+Cosine Decay
 ```
 
-With:
+没有显式 Warmup。
+
+大致：
+
+```text
+训练开始
+≈ 1.0 × base_lr
+
+训练中间
+≈ 0.55 × base_lr
+
+训练结束
+≈ 0.1 × base_lr
+```
+
+默认：
 
 ```text
 base_lr = 5e-4
 ```
 
-approximately:
+所以：
 
 ```text
-start  ≈ 5e-4
-middle = 2.75e-4
-end    = 5e-5
-```
-
-So the schedule is:
-
-```text
-high LR
-↓
-cosine decay
-↓
-10% of base LR
-```
-
-not:
-
-```text
-warmup
-→ peak
-→ cosine decay
+开始 ≈ 5e-4
+中间 ≈ 2.75e-4
+结束 ≈ 5e-5
 ```
 
 ---
 
-# 19. LR Advances by Micro Step
+# 31. LR 按 micro step 前进
 
-An important source-code detail:
+注意：
 
 ```python
 get_lr(...)
 ```
 
-is called for every DataLoader micro step.
+每一个 micro batch 都会执行。
 
-But:
-
-```python
-optimizer.step()
-```
-
-only occurs after gradient accumulation completes.
-
-For:
+如果：
 
 ```text
 accumulation_steps = 8
 ```
 
-the flow is:
+则：
 
 ```text
-step 1 → calculate lr1 → no optimizer update
-step 2 → calculate lr2 → no optimizer update
+step 1 → lr1 → 不更新参数
+step 2 → lr2 → 不更新参数
 ...
-step 7 → calculate lr7 → no optimizer update
-step 8 → calculate lr8 → optimizer.step()
+step 7 → lr7 → 不更新参数
+step 8 → lr8 → optimizer.step()
 ```
 
-So the actual parameter update uses the optimizer's LR value at step 8.
-
-Therefore the LR schedule advances by:
+所以这次 optimizer update 实际使用的是：
 
 ```text
-micro steps
+lr8
 ```
 
-rather than:
+当前 MiniMind 的学习率 schedule 是按：
 
 ```text
-optimizer updates
+micro step
 ```
 
-in this implementation.
+前进，而不是按：
+
+```text
+optimizer update 次数
+```
+
+前进。
 
 ---
 
-# 20. AdamW
+# 32. Checkpoint 保存
 
-MiniMind uses:
+MiniMind：
 
 ```python
-optimizer = optim.AdamW(
-    model.parameters(),
-    lr=args.learning_rate
-)
+if (
+    step % args.save_interval == 0
+    or step == iters
+):
 ```
 
-AdamW does not depend only on the current gradient.
-
-It also maintains optimizer history for each parameter, including concepts such as:
-
-```text
-m
-→ first moment / momentum-like state
-
-v
-→ second moment / squared-gradient state
-
-optimizer step
-→ update count
-```
-
-Therefore these optimizer states matter when resuming training.
-
----
-
-# 21. Checkpoint
-
-MiniMind saves model weights periodically when:
-
-```text
-step % save_interval == 0
-```
-
-or at the final step of the epoch.
-
-Default:
+默认：
 
 ```text
 save_interval = 1000
 ```
 
-So checkpoint saving is not performed after every training micro step.
+所以不是每个 step 都保存。
 
-There are two useful concepts:
+通常：
 
 ```text
-model weights
-→ what the model parameters currently are
-
-resume checkpoint
-→ a snapshot of the training state
+step 1000
+step 2000
+...
+epoch 最后
 ```
+
+保存。
 
 ---
 
-# 22. Resume Checkpoint
+# 33. 普通模型权重与 Resume Checkpoint
 
-MiniMind calls:
+普通模型权重：
 
-```python
-lm_checkpoint(
-    lm_config,
-    weight=args.save_weight,
-    model=model,
-    optimizer=optimizer,
-    scaler=scaler,
-    epoch=epoch,
-    step=step,
-    wandb=wandb,
-    save_dir='../checkpoints'
-)
+```text
+*.pth
 ```
 
-The resume state includes training information such as:
+主要表示：
+
+```text
+model.state_dict()
+```
+
+可以理解为：
+
+```text
+模型当前参数是什么
+```
+
+Resume Checkpoint：
+
+```text
+*_resume.pth
+```
+
+更像：
+
+```text
+训练现场快照
+```
+
+包含：
 
 ```text
 model
@@ -1112,23 +1615,20 @@ epoch
 step
 world_size
 wandb_id
+...
 ```
-
-The exact additional states depend on what is passed into `lm_checkpoint`.
 
 ---
 
-# 23. Why model.state_dict() Is Not Enough for Resume
+# 34. 为什么不能只恢复 Model
 
-Loading only:
+如果只：
 
 ```python
 model.load_state_dict(...)
 ```
 
-restores model parameters but does not fully restore the previous training state.
-
-For AdamW, the optimizer also has historical states such as:
+模型权重虽然回来了，但是 AdamW 的：
 
 ```text
 m
@@ -1136,216 +1636,170 @@ v
 optimizer step
 ```
 
-If they are lost, the model weights may be restored, but AdamW behaves like a newly initialized optimizer from that point.
+等历史状态会丢失。
 
-Therefore MiniMind also loads:
+所以这不算完整 Resume。
+
+MiniMind 恢复：
 
 ```python
+model.load_state_dict(
+    ckp_data['model']
+)
+
 optimizer.load_state_dict(
     ckp_data['optimizer']
 )
-```
 
-and:
-
-```python
 scaler.load_state_dict(
     ckp_data['scaler']
 )
 ```
 
-as well as:
+同时恢复：
 
 ```text
 epoch
 step
 ```
 
-The goal of resume training is:
+目标是：
 
 ```text
-restore the training state as completely as possible
+尽可能恢复上次中断时的完整训练状态
 ```
-
-rather than only restoring the model weights.
 
 ---
 
-# 24. Resume Position
+# 35. Resume Position
 
-MiniMind restores:
+Checkpoint 中：
+
+```text
+epoch
+step
+```
+
+用于知道训练进行到哪里。
+
+恢复时：
 
 ```python
 start_epoch = ckp_data['epoch']
 start_step = ckp_data.get('step', 0)
 ```
 
-It then uses:
+并配合：
 
-```python
-SkipBatchSampler(...)
+```text
+SkipBatchSampler
 ```
 
-to skip batches that have already been processed.
+跳过已经训练过的 batch。
 
-Conceptually:
+例如：
 
 ```text
 checkpoint:
 epoch = 1
 step = 500
-
-resume:
-start from that saved training position
-instead of restarting the epoch from batch 1
 ```
+
+恢复后不会简单重新从：
+
+```text
+epoch 1, step 1
+```
+
+开始，而是尽量从之前的训练位置继续。
 
 ---
 
-# 25. Full Training Loop Summary
+# 36. 今日完整中文口头总结
 
-The complete MiniMind pretraining sequence can be explained as follows:
+下面这段可以直接作为周三复习时的口头总结：
 
-> Raw JSON text first enters `PretrainDataset`. The tokenizer converts one sample into a fixed-length `input_ids [T]`; `labels [T]` are copied from `input_ids`, while PAD positions are replaced with `-100`. `DataLoader` combines multiple samples into a batch, so the training loop receives `input_ids [B,T]` and `labels [B,T]`.
+> 原始 JSON 数据首先经过 `PretrainDataset`。单个样本会被 Tokenizer 转成固定长度的 `input_ids [T]` 和 `labels [T]`，其中 labels 基本复制 input_ids，但 PAD 位置改为 `-100`。DataLoader 再把多个样本组成一个 batch，因此得到 `input_ids [B,T]` 和 `labels [B,T]`。
 >
-> `input_ids` enters MiniMind and first passes through the Embedding layer, becoming hidden states `[B,T,D]`. It then passes through multiple Transformer Blocks. Each Block contains RMSNorm, Attention, Residual, RMSNorm, SwiGLU FeedForward and another Residual connection, while the overall Block shape remains `[B,T,D]`. After all Blocks and the Final RMSNorm, the hidden states are still `[B,T,D]`. The LM Head projects the last dimension from `D` to vocabulary size `V`, producing logits `[B,T,V]`.
+> `input_ids` 输入 MiniMind 后，先经过 Embedding 得到 `[B,T,D]`，再经过多个 Transformer Block。每个 Block 内部依次进行 RMSNorm、Attention、Residual、RMSNorm、SwiGLU FeedForward、Residual，因此 Block 的输入输出都保持 `[B,T,D]`。经过所有 Block 和 Final RMSNorm 后仍为 `[B,T,D]`，再经过 LM Head 将 `D` 投影到 vocabulary size `V`，得到 logits `[B,T,V]`。
 >
-> The model performs next-token shifting internally: `logits[:, :-1, :]` is paired with `labels[:, 1:]`, and CrossEntropy produces a scalar language-model loss. Each micro-batch divides the loss by `accumulation_steps` and calls `backward()`, so gradients accumulate in `parameter.grad`.
+> 模型内部用 `logits[:, :-1, :]` 与 `labels[:, 1:]` 做 next-token prediction，经过 CrossEntropy 得到一个标量 loss。每个 micro batch 都会执行 `loss / accumulation_steps` 和 `backward()` 来累积梯度；当 `step % accumulation_steps == 0` 时，先 unscale，再进行 gradient clipping，然后执行 `optimizer.step()` 真正更新参数，最后 `zero_grad()` 清空梯度。
 >
-> Once `step % accumulation_steps == 0`, MiniMind first unscales gradients when required, then calls `clip_grad_norm_()`, performs the optimizer update, updates the GradScaler state, and finally clears gradients with `zero_grad()`. Thus, `backward()` calculates and accumulates gradients, while `optimizer.step()` is the operation that actually modifies model parameters.
+> 学习率由 `get_lr()` 按 micro step 计算并写入 optimizer。到达保存间隔或 epoch 末尾时，会保存模型权重以及用于恢复训练的 resume checkpoint，其中包含 model、optimizer、scaler、epoch、step 等训练状态。
 >
-> The learning rate is calculated by `get_lr()` on every micro step using cosine decay and written directly into the optimizer. At checkpoint intervals or the end of the epoch, MiniMind saves model weights and a resume checkpoint. A proper resume restores not only model weights but also optimizer state, scaler state, epoch and step information, because AdamW depends on historical states such as `m`, `v`, and optimizer step.
+> Gradient Accumulation 中需要特别区分 micro step 和 optimizer step。一个 micro step 只是处理一个 batch 并执行一次 backward，而 optimizer.step() 才真正修改模型参数。例如 batch size 为 32、accumulation steps 为 8 时，会连续处理 8 个 batch、执行 8 次 backward，再执行一次 optimizer.step()，也就是单进程下大约汇总 256 条 sequence 的梯度完成一次参数更新。
+>
+> Resume Training 也不能只加载 model 权重，因为 AdamW 还维护 m、v 和 optimizer step 等历史状态。因此完整恢复训练时还要加载 optimizer、scaler、epoch 和 step 等信息，目标是尽可能恢复上一次中断时的完整训练状态。
 
 ---
 
-## 25.1 中文完整训练流程总结
-
-原始 JSON 数据首先经过 `PretrainDataset`。单个样本会被 Tokenizer 转成固定长度的 `input_ids [T]` 和 `labels [T]`，其中 labels 基本复制 input_ids，但 PAD 位置改为 `-100`。DataLoader 再把多个样本组成一个 batch，因此得到 `input_ids [B,T]` 和 `labels [B,T]`。
-
-`input_ids` 输入 MiniMind 后，先经过 Embedding 得到 `[B,T,D]`，再经过多个 Transformer Block。每个 Block 内部依次进行 RMSNorm、Attention、Residual、RMSNorm、SwiGLU FeedForward、Residual，因此 Block 的输入输出都保持 `[B,T,D]`。经过所有 Block 和 Final RMSNorm 后仍为 `[B,T,D]`，再经过 LM Head 将 `D` 投影到 vocabulary size `V`，得到 logits `[B,T,V]`。
-
-模型内部用 `logits[:, :-1, :]` 与 `labels[:, 1:]` 做 next-token prediction，经过 CrossEntropy 得到一个标量 loss。每个 micro batch 都会执行 `loss / accumulation_steps` 和 `backward()` 来累积梯度；当 `step % accumulation_steps == 0` 时，先 unscale，再进行 gradient clipping，然后执行 `optimizer.step()` 真正更新参数，最后 `zero_grad()` 清空梯度。
-
-学习率由 `get_lr()` 按 micro step 计算并写入 optimizer。到达保存间隔或 epoch 末尾时，会保存模型权重以及用于恢复训练的 resume checkpoint，其中包含 model、optimizer、scaler、epoch、step 等训练状态。
-
-# 26. Full Shape Flow
-
-With:
+# 37. 完整 Shape Flow
 
 ```text
-B = batch size
-T = sequence length
-D = hidden size
-V = vocabulary size
-```
-
-the complete shape flow is:
-
-```text
-Dataset item
+JSON Sample
+↓
+Tokenizer
 
 input_ids [T]
 labels    [T]
 
-↓
-
-DataLoader
+↓ DataLoader
 
 input_ids [B,T]
 labels    [B,T]
 
-↓
+↓ MiniMind
 
 Embedding
+[B,T,D]
 
-hidden_states [B,T,D]
+↓ Transformer Block × N
 
-↓
+[B,T,D]
 
-Transformer Block × N
+↓ Final RMSNorm
 
-hidden_states [B,T,D]
+[B,T,D]
 
-↓
+↓ LM Head
 
-Final RMSNorm
+logits
+[B,T,V]
 
-hidden_states [B,T,D]
-
-↓
-
-LM Head
-
-logits [B,T,V]
-
-↓
-
-Next-token shift
+↓ Next-token Shift
 
 x [B,T-1,V]
 y [B,T-1]
 
-↓
-
-Flatten
+↓ Flatten
 
 x [B×(T-1),V]
 y [B×(T-1)]
 
-↓
+↓ CrossEntropy
 
-CrossEntropy
+loss
+scalar
 
-loss scalar
-```
+↓ / accumulation_steps
 
-Default MiniMind pretrain example:
+scaled training loss
 
-```text
-input_ids
-[32,340]
+↓ backward × N
 
-↓
+accumulated gradients
 
-Embedding
+↓ unscale
+↓ clip_grad_norm_
+↓ optimizer.step()
+↓ zero_grad()
 
-[32,340,768]
-
-↓
-
-8 Transformer Blocks
-
-[32,340,768]
-
-↓
-
-Final RMSNorm
-
-[32,340,768]
-
-↓
-
-LM Head
-
-[32,340,6400]
-
-↓
-
-Shift
-
-x [32,339,6400]
-y [32,339]
-
-↓
-
-CrossEntropy
-
-scalar loss
+parameters updated
 ```
 
 ---
 
-# 27. Key Default Training Arguments
+# 38. MiniMind 默认训练参数
 
 ```text
 epochs              = 2
@@ -1362,135 +1816,237 @@ seed                = 42
 use_moe             = False
 ```
 
-Single-process effective batch size:
+单进程 Effective Batch：
 
 ```text
-32 × 8 = 256 sequences
+32 × 8
+=
+256 sequences
 ```
 
 ---
 
-# 28. Common Mistakes to Avoid
+# 39. 常见易错点
 
-## Mistake 1
+### 易错点 1
+
+错误：
 
 ```text
 input_ids [B,T,D]
 ```
 
-Wrong.
-
-Correct:
+正确：
 
 ```text
 input_ids [B,T]
 ```
 
-Only after Embedding:
-
-```text
-hidden_states [B,T,D]
-```
-
-## Mistake 2
-
-Thinking SwiGLU directly outputs logits.
-
-Wrong.
-
-SwiGLU / Transformer Block ends at:
+Embedding 后才是：
 
 ```text
 [B,T,D]
 ```
 
-The LM Head creates:
+---
+
+### 易错点 2
+
+错误：
 
 ```text
-[B,T,V]
+labels [B,T,V]
 ```
 
-## Mistake 3
-
-Thinking `backward()` updates model parameters.
-
-Wrong.
+正确：
 
 ```text
-backward()
-→ calculate / accumulate gradients
-
-optimizer.step()
-→ update model parameters
+labels [B,T]
 ```
 
-## Mistake 4
-
-Thinking `step` in the DataLoader loop is the same as `optimizer.step()`.
-
-Wrong.
-
-With gradient accumulation:
-
-```text
-multiple micro steps
-→ one optimizer update
-```
-
-## Mistake 5
-
-Thinking MiniMind pretrain currently uses Warmup + Cosine.
-
-In this source version, `get_lr()` implements cosine decay without an explicit warmup phase.
-
-## Mistake 6
-
-Thinking a model weight file alone is a full resume checkpoint.
-
-A proper resume also needs optimizer and other training states.
+每个位置只存一个目标 Token ID。
 
 ---
 
-# 29. Day 3 Core Memory
+### 易错点 3
 
-The shortest version to remember:
+错误：
+
+```text
+SwiGLU 后直接得到 logits
+```
+
+正确：
+
+```text
+SwiGLU / Block
+→ [B,T,D]
+
+Final RMSNorm
+→ [B,T,D]
+
+LM Head
+→ [B,T,V]
+```
+
+---
+
+### 易错点 4
+
+错误：
+
+```text
+backward()
+=
+更新模型参数
+```
+
+正确：
+
+```text
+backward()
+=
+计算 / 累积梯度
+```
+
+真正更新：
+
+```text
+optimizer.step()
+```
+
+---
+
+### 易错点 5
+
+错误：
+
+```text
+一个 DataLoader step
+=
+一次 optimizer.step()
+```
+
+使用 Gradient Accumulation 时：
+
+```text
+多个 micro step
+→ 一次 optimizer.step()
+```
+
+---
+
+### 易错点 6
+
+错误：
+
+```text
+MiniMind 当前 Pretrain 使用 Warmup + Cosine
+```
+
+当前源码中的 `get_lr()` 是：
+
+```text
+Cosine Decay
+```
+
+没有显式 Warmup。
+
+---
+
+### 易错点 7
+
+错误：
+
+```text
+只恢复 model.state_dict()
+就等于完整 Resume
+```
+
+正确：
+
+```text
+完整 Resume
+还要尽量恢复：
+optimizer
+scaler
+epoch
+step
+...
+```
+
+---
+
+# 40. 最短复习版
+
+如果只剩一分钟，记住：
 
 ```text
 JSON
 ↓
-Dataset
+PretrainDataset
 [T]
 
 ↓ DataLoader
 
-[B,T]
+input_ids [B,T]
+labels [B,T]
 
 ↓ Model
 
-[B,T,V]
+hidden_states [B,T,D]
 
-↓ shift
+↓ LM Head
+
+logits [B,T,V]
+
+↓ Shift
 
 x [B,T-1,V]
 y [B,T-1]
 
-↓ CE
+↓ CrossEntropy
 
 loss
 
 ↓ loss / accumulation_steps
 ↓ backward × N
 
-accumulated gradients
+累计梯度
 
 ↓ unscale
 ↓ clip
 ↓ optimizer.step
 ↓ zero_grad
 
-parameter update
+更新参数
 
 ↓ checkpoint
 
-save model + training state
+保存模型和训练状态
+```
+
+再记一句：
+
+```text
+backward() = 算梯度
+optimizer.step() = 更新参数
+```
+
+以及：
+
+```text
+micro step ≠ optimizer step
+```
+
+默认：
+
+```text
+batch_size = 32
+accumulation_steps = 8
+
+8 个 micro batch
+→ 8 次 backward
+→ 256 条 sequence
+→ 1 次 optimizer.step()
 ```
